@@ -549,6 +549,59 @@ async fn reconnection_resends_unacked_packets_from_the_previous_connection_first
 }
 
 #[tokio::test]
+async fn new_requests_carried_over_a_reconnection_wait_for_a_free_packet_id() {
+    let mut options = MqttOptions::new("dummy", "127.0.0.1", 3005);
+    options
+        .set_keep_alive(Duration::from_secs(5))
+        .set_clean_session(false)
+        .set_inflight(2);
+
+    // two publishes fill the inflight window, so the subscribe behind them stays in the
+    // request channel until the connection drops and moves it to the pending queue
+    let (client, mut eventloop) = AsyncClient::new(options, 5);
+    task::spawn(async move {
+        start_requests(2, QoS::AtLeastOnce, 0, client.clone()).await;
+        client
+            .subscribe("hello/world", QoS::AtLeastOnce)
+            .await
+            .unwrap();
+        time::sleep(Duration::from_secs(10)).await;
+    });
+
+    task::spawn(async move {
+        run(&mut eventloop, true).await.unwrap();
+    });
+
+    // broker connection 1. receive but don't ack, then drop the connection
+    let mut broker = Broker::new(3005, 0, false).await;
+    for i in 1..=2 {
+        let packet = broker.read_publish().await.unwrap();
+        assert_eq!(i, packet.payload[0]);
+    }
+    time::sleep(Duration::from_millis(200)).await;
+    drop(broker);
+
+    // broker connection 2 resumes the session: both publishes are retransmitted with their ids
+    let mut broker = Broker::new(3005, 0, true).await;
+    for i in 1..=2 {
+        let packet = broker.read_publish().await.unwrap();
+        assert_eq!(i, packet.payload[0]);
+        assert_eq!(i as u16, packet.pkid);
+    }
+
+    // both packet ids are in use, so the subscribe must wait for an ack
+    if let Ok(packet) = time::timeout(Duration::from_secs(1), broker.read_packet()).await {
+        panic!("Expected nothing before an ack. Found = {packet:?}");
+    }
+
+    broker.ack(1).await;
+    match broker.read_packet().await {
+        Some(Packet::Subscribe(subscribe)) => assert_eq!(subscribe.pkid, 1),
+        packet => panic!("Expected a subscribe. Found = {packet:?}"),
+    }
+}
+
+#[tokio::test]
 async fn state_is_being_cleaned_properly_and_pending_request_calculated_properly() {
     let mut options = MqttOptions::new("dummy", "127.0.0.1", 3004);
     options.set_keep_alive(Duration::from_secs(5));
