@@ -4,6 +4,7 @@ use crate::{MqttOptions, Outgoing};
 
 use crate::framed::AsyncReadWrite;
 use crate::mqttbytes::v4::*;
+use crate::mqttbytes::QoS;
 use flume::{bounded, Receiver, Sender};
 use tokio::net::{lookup_host, TcpSocket, TcpStream};
 use tokio::select;
@@ -127,7 +128,12 @@ impl EventLoop {
     pub fn clean(&mut self) {
         self.network = None;
         self.keepalive_timeout = None;
-        self.pending.extend(self.state.clean());
+
+        // Packets awaiting acks were sent before the requests still pending, so they go first.
+        // This keeps every retransmission ahead of the requests which take a new packet id.
+        let mut pending: VecDeque<Request> = self.state.clean().into();
+        pending.append(&mut self.pending);
+        self.pending = pending;
 
         // drain requests from channel which weren't yet received
         let mut requests_in_channel: Vec<_> = self.requests_rx.drain().collect();
@@ -187,6 +193,10 @@ impl EventLoop {
         // let await_acks = self.state.await_acks;
         let inflight_full = self.state.inflight >= self.mqtt_options.inflight;
         let collision = self.state.collision.is_some();
+        let flow_open = !inflight_full && !collision;
+        // A pending retransmission keeps its packet id, so only flow control holds it back
+        let pending_ready =
+            matches!(self.pending.front(), Some(request) if !takes_new_pkid(request));
         let network_timeout = Duration::from_secs(self.network_options.connection_timeout());
 
         // Read buffered events from previous polls before calling a new poll
@@ -212,35 +222,25 @@ impl EventLoop {
             // If available, prioritises pending requests from previous session.
             // Else, pulls next request from user requests channel.
             // If conditions in the below branch are for flow control.
-            // The branch is disabled if there's no pending messages and new user requests
-            // cannot be serviced due flow control.
-            // We read next user user request only when inflight messages are < configured inflight
-            // and there are no collisions while handling previous outgoing requests.
+            // The branch is disabled if the next request cannot be serviced due to flow control.
+            // We read the next user request, or a pending one which needs a new packet id, only
+            // when inflight messages are < configured inflight and there are no collisions while
+            // handling previous outgoing requests.
             //
-            // Flow control is based on ack count. If inflight packet count in the buffer is
-            // less than max_inflight setting, next outgoing request will progress. For this
-            // to work correctly, broker should ack in sequence (a lot of brokers won't)
+            // Flow control is based on ack count. Every publish, release, subscribe and
+            // unsubscribe awaiting its ack holds its packet id and counts as inflight, and new
+            // packet ids skip the ones in use. So while inflight messages are < max_inflight,
+            // a free packet id exists even when the broker acks out of order.
             //
-            // E.g If max inflight = 5, user requests will be blocked when inflight queue
-            // looks like this                 -> [1, 2, 3, 4, 5].
-            // If broker acking 2 instead of 1 -> [1, x, 3, 4, 5].
-            // This pulls next user request. But because max packet id = max_inflight, next
-            // user request's packet id will roll to 1. This replaces existing packet id 1.
-            // Resulting in a collision
-            //
-            // Eventloop can stop receiving outgoing user requests when previous outgoing
-            // request collided. I.e collision state. Collision state will be cleared only
-            // when correct ack is received
-            // Full inflight queue will look like -> [1a, 2, 3, 4, 5].
-            // If 3 is acked instead of 1 first   -> [1a, 2, x, 4, 5].
-            // After collision with pkid 1        -> [1b ,2, x, 4, 5].
-            // 1a is saved to state and event loop is set to collision mode stopping new
-            // outgoing requests (along with 1b).
+            // A collision happens when a publish already carries a packet id which is in use,
+            // e.g. a retransmission. It is saved to state and the eventloop is set to collision
+            // mode, stopping new outgoing requests. Collision state is cleared when the packet
+            // holding that id is acked.
             o = Self::next_request(
                 &mut self.pending,
                 &self.requests_rx,
                 self.mqtt_options.pending_throttle
-            ), if !self.pending.is_empty() || (!inflight_full && !collision) => match o {
+            ), if pending_ready || flow_open => match o {
                 Ok(request) => {
                     if let Some(outgoing) = self.state.handle_outgoing_packet(request)? {
                         network.write(outgoing).await?;
@@ -297,6 +297,17 @@ impl EventLoop {
                 Err(_) => Err(ConnectionError::RequestsDone),
             }
         }
+    }
+}
+
+/// Whether handling `request` takes a new packet id: a subscribe, an unsubscribe, or a QoS 1 or 2
+/// publish which doesn't carry one yet
+fn takes_new_pkid(request: &Request) -> bool {
+    match request {
+        Request::Publish(publish) => publish.qos != QoS::AtMostOnce && publish.pkid == 0,
+        Request::PubRel(pubrel) => pubrel.pkid == 0,
+        Request::Subscribe(_) | Request::Unsubscribe(_) => true,
+        _ => false,
     }
 }
 

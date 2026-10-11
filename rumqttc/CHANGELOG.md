@@ -9,9 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 ### Changed
+* Subscribes and unsubscribes count toward the inflight limit (v5: the broker's Receive Maximum) until they are acked, so with the limit reached they wait for an ack like publishes do.
+* Requests carried over a reconnection which need a new packet id wait for flow control like new requests. Retransmissions are queued ahead of them.
+
 ### Deprecated
 ### Removed
 ### Fixed 
+* Packet ids are no longer reused while the packet holding them awaits its ack (#1057). Subscribes and unsubscribes hold their packet id until the SubAck/UnsubAck, new packet ids skip every id in use, and a publish no longer takes the id of an outstanding PubRel.
+* `MqttState::clean()` keeps a publish stashed on a collision instead of dropping it and blocking new requests forever (#1056).
+* A publish sent after its collision is resolved by a PubComp, SubAck or UnsubAck is tracked until acked.
+* v5: a PubAck, PubRec or PubComp with a failure reason code frees its packet id and inflight slot, and sends a publish which collided on that id.
+
 ### Security
 
 
