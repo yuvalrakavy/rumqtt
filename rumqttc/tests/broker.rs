@@ -122,6 +122,40 @@ impl Broker {
         self.framed.write(packet).await.unwrap();
     }
 
+    /// Reads the next packet, buffered or from the stream, answering pings on the way. Returns
+    /// `None` when nothing comes within `timeout`
+    pub async fn next_packet(&mut self, timeout: Duration) -> Option<Packet> {
+        loop {
+            if self.incoming.is_empty() {
+                match time::timeout(timeout, self.framed.readb(&mut self.incoming)).await {
+                    Ok(Ok(())) => (),
+                    _ => return None,
+                }
+            }
+
+            match self.incoming.pop_front()? {
+                Packet::PingReq => {
+                    self.framed.write(Packet::PingResp).await.unwrap();
+                }
+                packet => return Some(packet),
+            }
+        }
+    }
+
+    /// Sends a subscribe acknowledgement
+    pub async fn suback(&mut self, pkid: u16) {
+        // not through `Network::write`: a client never sends a suback, so there is no `Outgoing`
+        // for it
+        let suback = SubAck::new(pkid, vec![SubscribeReasonCode::Success(QoS::AtLeastOnce)]);
+        suback.write(&mut self.framed.write).unwrap();
+        self.framed
+            .socket
+            .write_all(&self.framed.write[..])
+            .await
+            .unwrap();
+        self.framed.write.clear();
+    }
+
     /// Sends an acknowledgement
     pub async fn pingresp(&mut self) {
         let packet = Packet::PingResp;
