@@ -88,14 +88,16 @@ pub struct MqttState {
     last_outgoing: Instant,
     /// Packet id of the last outgoing packet
     pub(crate) last_pkid: u16,
-    /// Number of outgoing packets holding a packet id until they are acked: QoS 1, 2 publishes,
-    /// releases, subscribes and unsubscribes
+    /// Number of outgoing QoS 1, 2 publishes and releases which aren't acked yet. Only these count
+    /// toward the broker's Receive Maximum (MQTT 5 section 4.9). Subscribes and unsubscribes hold
+    /// a packet id until they are acked too, but don't count
     pub(crate) inflight: u16,
     /// Outgoing QoS 1, 2 publishes which aren't acked yet
     pub(crate) outgoing_pub: Vec<Option<Publish>>,
     /// Packet ids of released QoS 2 publishes
     pub(crate) outgoing_rel: FixedBitSet,
-    /// Packet ids of subscribes and unsubscribes which aren't acked yet
+    /// Packet ids of subscribes and unsubscribes which aren't acked yet. They are above
+    /// `max_outgoing_inflight`, unless that spans every packet id
     pub(crate) outgoing_sub_unsub: FixedBitSet,
     /// Packet ids on incoming QoS 2 publishes
     pub(crate) incoming_pub: FixedBitSet,
@@ -130,7 +132,7 @@ impl MqttState {
             // index 0 is wasted as 0 is not a valid packet id
             outgoing_pub: vec![None; max_inflight as usize + 1],
             outgoing_rel: FixedBitSet::with_capacity(max_inflight as usize + 1),
-            outgoing_sub_unsub: FixedBitSet::with_capacity(max_inflight as usize + 1),
+            outgoing_sub_unsub: FixedBitSet::with_capacity(u16::MAX as usize + 1),
             incoming_pub: FixedBitSet::with_capacity(u16::MAX as usize + 1),
             collision: None,
             // TODO: Optimize these sizes later
@@ -651,19 +653,38 @@ impl MqttState {
         Some(Packet::Publish(publish))
     }
 
-    /// Takes a free pkid for a subscribe or unsubscribe and holds it until the ack
+    /// Takes a free pkid for a subscribe or unsubscribe and holds it until the ack. It doesn't
+    /// count toward `inflight`: the Receive Maximum limits only publishes
     fn take_sub_unsub_pkid(&mut self) -> Result<u16, StateError> {
-        let pkid = self.next_pkid();
-        if self.is_pkid_in_use(pkid) {
-            // Every pkid is in use. The eventloop takes no request needing a pkid while
-            // `inflight` is at the maximum, so this is reached only when that limit is ignored
-            error!("No free packet id for a subscribe or unsubscribe");
-            return Err(StateError::InvalidState);
-        }
+        let pkid = match self.free_sub_unsub_pkid() {
+            Some(pkid) => pkid,
+            None => {
+                // The eventloop takes no subscribe or unsubscribe while every pkid it could take
+                // is in use, so this is reached only when `sub_unsub_pkid_available` is ignored
+                error!("No free packet id for a subscribe or unsubscribe");
+                return Err(StateError::InvalidState);
+            }
+        };
 
         self.outgoing_sub_unsub.insert(pkid as usize);
-        self.inflight += 1;
         Ok(pkid)
+    }
+
+    /// Whether a subscribe or unsubscribe can take a packet id now. While it can't, the
+    /// eventloop holds back the requests which could be one, as it holds back requests while
+    /// `inflight` is at the maximum
+    pub(crate) fn sub_unsub_pkid_available(&self) -> bool {
+        self.free_sub_unsub_pkid().is_some()
+    }
+
+    /// The lowest free pkid a subscribe or unsubscribe can take. Those above
+    /// `max_outgoing_inflight` are never needed by a new publish, so subscribes and unsubscribes
+    /// don't shrink the window of publishes. When the window spans every pkid, any free one is
+    /// taken and `next_pkid` skips it.
+    fn free_sub_unsub_pkid(&self) -> Option<u16> {
+        let window = self.max_outgoing_inflight.max(1);
+        let first = if window < u16::MAX { window + 1 } else { 1 };
+        (first..=u16::MAX).find(|&pkid| !self.is_pkid_in_use(pkid))
     }
 
     /// Frees the pkid of a subscribe or unsubscribe on its ack, and sends the publish which
@@ -675,7 +696,6 @@ impl MqttState {
         }
 
         self.outgoing_sub_unsub.set(pkid as usize, false);
-        self.inflight -= 1;
         self.send_collision(pkid)
     }
 
@@ -704,10 +724,11 @@ impl MqttState {
     }
 
     /// http://stackoverflow.com/questions/11115364/mqtt-messageid-practical-implementation
-    /// Packet ids cycle through 1 to the maximum set inflight messages, skipping those still in
-    /// use (MQTT 5 section 2.2.1). When all of them are in use, which the eventloop prevents by
-    /// taking no request while `inflight` is at the maximum, the next one in the cycle is
-    /// returned and the caller detects the collision.
+    /// Packet ids of publishes cycle through 1 to the maximum set inflight messages, skipping
+    /// those still in use (MQTT 5 section 2.2.1). When all of them are in use, which the
+    /// eventloop prevents by taking no request while `inflight` is at the maximum or no packet
+    /// id is free for a subscribe, the next one in the cycle is returned and the caller detects
+    /// the collision.
     fn next_pkid(&mut self) -> u16 {
         let max = self.max_outgoing_inflight.max(1);
         let following = |pkid: u16| if pkid >= max { 1 } else { pkid + 1 };
@@ -1090,6 +1111,13 @@ mod test {
         }
     }
 
+    fn unsubscribe_pkid(packet: Option<Packet>) -> u16 {
+        match packet {
+            Some(Packet::Unsubscribe(unsubscribe)) => unsubscribe.pkid,
+            packet => panic!("Expected an unsubscribe. Found = {:?}", packet),
+        }
+    }
+
     fn publish_pkid(packet: Option<Packet>) -> u16 {
         match packet {
             Some(Packet::Publish(publish)) => publish.pkid,
@@ -1097,9 +1125,16 @@ mod test {
         }
     }
 
+    /// A state after a connack with a receive maximum of 2
+    fn build_mqttstate_with_receive_maximum_2() -> MqttState {
+        let mut mqtt = build_mqttstate();
+        mqtt.max_outgoing_inflight = 2;
+        mqtt
+    }
+
     #[test]
     fn subscribe_does_not_reuse_the_pkid_of_an_outstanding_publish() {
-        let mut mqtt = MqttState::new(2, false);
+        let mut mqtt = build_mqttstate_with_receive_maximum_2();
 
         let publish = build_outgoing_publish(QoS::AtLeastOnce);
         assert_eq!(
@@ -1109,44 +1144,47 @@ mod test {
         assert_eq!(publish_pkid(mqtt.outgoing_publish(publish).unwrap()), 2);
         mqtt.handle_incoming_puback(&PubAck::new(2, None)).unwrap();
 
-        // publish 1 still awaits its puback: 2 is the only free packet id
+        // publish 1 still awaits its puback. The subscribe takes an id above the publish window
         let subscribe = mqtt.outgoing_subscribe(build_subscribe()).unwrap();
-        assert_eq!(subscribe_pkid(subscribe), 2);
-        assert_eq!(mqtt.inflight, 2);
+        assert_eq!(subscribe_pkid(subscribe), 3);
+        assert_eq!(mqtt.inflight, 1);
     }
 
     #[test]
     fn unsubscribe_does_not_reuse_the_pkid_of_an_outstanding_publish() {
-        let mut mqtt = MqttState::new(2, false);
+        let mut mqtt = build_mqttstate_with_receive_maximum_2();
 
         let publish = build_outgoing_publish(QoS::AtLeastOnce);
         mqtt.outgoing_publish(publish.clone()).unwrap();
         mqtt.outgoing_publish(publish).unwrap();
         mqtt.handle_incoming_puback(&PubAck::new(2, None)).unwrap();
 
-        match mqtt.outgoing_unsubscribe(build_unsubscribe()).unwrap() {
-            Some(Packet::Unsubscribe(unsubscribe)) => assert_eq!(unsubscribe.pkid, 2),
-            packet => panic!("Expected an unsubscribe. Found = {:?}", packet),
-        }
-        assert_eq!(mqtt.inflight, 2);
+        let unsubscribe = mqtt.outgoing_unsubscribe(build_unsubscribe()).unwrap();
+        assert_eq!(unsubscribe_pkid(unsubscribe), 3);
+        assert_eq!(mqtt.inflight, 1);
     }
 
     #[test]
     fn publish_does_not_reuse_the_pkid_of_an_outstanding_subscribe() {
-        let mut mqtt = MqttState::new(2, false);
-
-        let subscribe = mqtt.outgoing_subscribe(build_subscribe()).unwrap();
-        assert_eq!(subscribe_pkid(subscribe), 1);
+        // no receive maximum: the publish window spans every packet id, so subscribes share the
+        // ids of publishes
+        let mut mqtt = build_mqttstate();
 
         let publish = build_outgoing_publish(QoS::AtLeastOnce);
         assert_eq!(
             publish_pkid(mqtt.outgoing_publish(publish.clone()).unwrap()),
-            2
+            1
         );
-        mqtt.handle_incoming_puback(&PubAck::new(2, None)).unwrap();
+        let subscribe = mqtt.outgoing_subscribe(build_subscribe()).unwrap();
+        assert_eq!(subscribe_pkid(subscribe), 2);
+        mqtt.handle_incoming_puback(&PubAck::new(1, None)).unwrap();
 
-        // subscribe 1 still awaits its suback: 2 is the only free packet id
-        assert_eq!(publish_pkid(mqtt.outgoing_publish(publish).unwrap()), 2);
+        // the publish ids cycle back to the start: 1 is free again, 2 is not
+        mqtt.last_pkid = u16::MAX - 1;
+        let pkids: Vec<u16> = (0..3)
+            .map(|_| publish_pkid(mqtt.outgoing_publish(publish.clone()).unwrap()))
+            .collect();
+        assert_eq!(pkids, vec![u16::MAX, 1, 3]);
         assert!(mqtt.collision.is_none());
     }
 
@@ -1170,19 +1208,44 @@ mod test {
     }
 
     #[test]
-    fn subscribes_count_toward_the_receive_maximum() {
-        let mut mqtt = build_mqttstate();
-        // as a connack with a receive maximum of 2 sets it
-        mqtt.max_outgoing_inflight = 2;
+    fn subscribes_do_not_count_toward_the_receive_maximum() {
+        let mut mqtt = build_mqttstate_with_receive_maximum_2();
 
         let first = mqtt.outgoing_subscribe(build_subscribe()).unwrap();
         let second = mqtt.outgoing_subscribe(build_subscribe()).unwrap();
-        assert_eq!(subscribe_pkid(first), 1);
-        assert_eq!(subscribe_pkid(second), 2);
+        assert_eq!(subscribe_pkid(first), 3);
+        assert_eq!(subscribe_pkid(second), 4);
+        assert_eq!(mqtt.inflight(), 0);
 
-        // the window is full, so the eventloop takes no new request...
+        // with both subscribes awaiting their subacks, the whole window is open to publishes
+        let publish = build_outgoing_publish(QoS::AtLeastOnce);
+        assert_eq!(
+            publish_pkid(mqtt.outgoing_publish(publish.clone()).unwrap()),
+            1
+        );
+        assert_eq!(publish_pkid(mqtt.outgoing_publish(publish).unwrap()), 2);
+        assert!(mqtt.collision.is_none());
         assert_eq!(mqtt.inflight(), 2);
-        // ...and a subscribe pushed regardless is refused instead of reusing an outstanding id
+
+        // and a full window of publishes doesn't hold back a subscribe
+        let third = mqtt.outgoing_subscribe(build_subscribe()).unwrap();
+        assert_eq!(subscribe_pkid(third), 5);
+        assert_eq!(mqtt.inflight(), 2);
+    }
+
+    #[test]
+    fn subscribe_is_refused_while_every_pkid_it_could_take_is_in_use() {
+        // a receive maximum of u16::MAX - 2 leaves packet ids u16::MAX - 1 and u16::MAX
+        let mut mqtt = build_mqttstate();
+        mqtt.max_outgoing_inflight = u16::MAX - 2;
+
+        let first = mqtt.outgoing_subscribe(build_subscribe()).unwrap();
+        let second = mqtt.outgoing_unsubscribe(build_unsubscribe()).unwrap();
+        assert_eq!(subscribe_pkid(first), u16::MAX - 1);
+        assert_eq!(unsubscribe_pkid(second), u16::MAX);
+
+        // the eventloop holds a subscribe back now. One pushed regardless is refused instead of
+        // reusing an outstanding id
         let events = mqtt.events.len();
         match mqtt.outgoing_subscribe(build_subscribe()) {
             Err(StateError::InvalidState) => (),
@@ -1190,50 +1253,61 @@ mod test {
         }
         assert_eq!(mqtt.events.len(), events);
 
+        // publishes still have their window
+        let publish = build_outgoing_publish(QoS::AtLeastOnce);
+        assert_eq!(publish_pkid(mqtt.outgoing_publish(publish).unwrap()), 1);
+
         // a suback frees its packet id
-        mqtt.handle_incoming_packet(build_suback(1)).unwrap();
-        assert_eq!(mqtt.inflight(), 1);
+        mqtt.handle_incoming_packet(build_suback(u16::MAX - 1))
+            .unwrap();
         let third = mqtt.outgoing_subscribe(build_subscribe()).unwrap();
-        assert_eq!(subscribe_pkid(third), 1);
-        assert_eq!(mqtt.inflight(), 2);
+        assert_eq!(subscribe_pkid(third), u16::MAX - 1);
     }
 
     #[test]
     fn suback_and_unsuback_free_their_pkids() {
         let mut mqtt = MqttState::new(2, false);
 
-        mqtt.outgoing_subscribe(build_subscribe()).unwrap();
-        mqtt.outgoing_unsubscribe(build_unsubscribe()).unwrap();
-        assert_eq!(mqtt.inflight, 2);
+        let subscribe = mqtt.outgoing_subscribe(build_subscribe()).unwrap();
+        let unsubscribe = mqtt.outgoing_unsubscribe(build_unsubscribe()).unwrap();
+        assert_eq!(subscribe_pkid(subscribe), 3);
+        assert_eq!(unsubscribe_pkid(unsubscribe), 4);
 
-        mqtt.handle_incoming_packet(build_suback(1)).unwrap();
-        assert_eq!(mqtt.inflight, 1);
-        mqtt.handle_incoming_packet(build_unsuback(2)).unwrap();
-        assert_eq!(mqtt.inflight, 0);
+        // while held, the ids aren't taken again
+        let subscribe = mqtt.outgoing_subscribe(build_subscribe()).unwrap();
+        assert_eq!(subscribe_pkid(subscribe), 5);
+
+        mqtt.handle_incoming_packet(build_suback(3)).unwrap();
+        mqtt.handle_incoming_packet(build_unsuback(4)).unwrap();
+        let subscribe = mqtt.outgoing_subscribe(build_subscribe()).unwrap();
+        assert_eq!(subscribe_pkid(subscribe), 3);
+        let unsubscribe = mqtt.outgoing_unsubscribe(build_unsubscribe()).unwrap();
+        assert_eq!(unsubscribe_pkid(unsubscribe), 4);
 
         // an unsolicited acknowledgement frees nothing
-        mqtt.handle_incoming_packet(build_suback(1)).unwrap();
-        mqtt.handle_incoming_packet(build_unsuback(2)).unwrap();
+        mqtt.handle_incoming_packet(build_suback(9)).unwrap();
+        mqtt.handle_incoming_packet(build_unsuback(9)).unwrap();
         assert_eq!(mqtt.inflight, 0);
     }
 
     #[test]
     fn publish_colliding_with_a_subscribe_is_sent_on_its_suback() {
-        let mut mqtt = MqttState::new(2, false);
+        let mut mqtt = build_mqttstate_with_receive_maximum_2();
 
         let subscribe = mqtt.outgoing_subscribe(build_subscribe()).unwrap();
-        assert_eq!(subscribe_pkid(subscribe), 1);
+        assert_eq!(subscribe_pkid(subscribe), 3);
 
-        // a publish that already carries packet id 1, as a retransmission does
+        // a publish that already carries packet id 3: a retransmission from a connection whose
+        // receive maximum was larger
         let mut publish = build_outgoing_publish(QoS::AtLeastOnce);
-        publish.pkid = 1;
+        publish.pkid = 3;
         assert!(mqtt.outgoing_publish(publish).unwrap().is_none());
         assert!(mqtt.collision.is_some());
 
-        let packet = mqtt.handle_incoming_packet(build_suback(1)).unwrap();
-        assert_eq!(publish_pkid(packet), 1);
+        let packet = mqtt.handle_incoming_packet(build_suback(3)).unwrap();
+        assert_eq!(publish_pkid(packet), 3);
         assert!(mqtt.collision.is_none());
-        assert!(mqtt.outgoing_pub[1].is_some());
+        assert!(mqtt.outgoing_pub[3].is_some());
         assert_eq!(mqtt.inflight, 1);
     }
 
@@ -1326,12 +1400,12 @@ mod test {
 
         mqtt.outgoing_subscribe(build_subscribe()).unwrap();
         mqtt.outgoing_unsubscribe(build_unsubscribe()).unwrap();
-        assert_eq!(mqtt.inflight, 2);
 
         // subscribes and unsubscribes aren't retransmitted
         assert!(mqtt.clean().is_empty());
-        assert_eq!(mqtt.inflight, 0);
         let subscribe = mqtt.outgoing_subscribe(build_subscribe()).unwrap();
-        assert_eq!(subscribe_pkid(subscribe), 1);
+        assert_eq!(subscribe_pkid(subscribe), 3);
+        let unsubscribe = mqtt.outgoing_unsubscribe(build_unsubscribe()).unwrap();
+        assert_eq!(unsubscribe_pkid(unsubscribe), 4);
     }
 }

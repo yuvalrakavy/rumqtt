@@ -188,9 +188,18 @@ impl EventLoop {
         let inflight_full = self.state.inflight >= self.state.max_outgoing_inflight;
         let collision = self.state.collision.is_some();
         let flow_open = !inflight_full && !collision;
-        // A pending retransmission keeps its packet id, so only flow control holds it back
-        let pending_ready =
-            matches!(self.pending.front(), Some(request) if !takes_new_pkid(request));
+        let requests_ready = match self.pending.front() {
+            // A pending publish or release which takes a new packet id waits for flow control
+            Some(request) if takes_new_publish_pkid(request) => flow_open,
+            // A pending subscribe or unsubscribe waits only for a free packet id
+            Some(Request::Subscribe(_) | Request::Unsubscribe(_)) => {
+                self.state.sub_unsub_pkid_available()
+            }
+            // A pending retransmission keeps its packet id
+            Some(_) => true,
+            // The next user request could be either
+            None => flow_open && self.state.sub_unsub_pkid_available(),
+        };
 
         // Read buffered events from previous polls before calling a new poll
         if let Some(event) = self.state.events.pop_front() {
@@ -205,14 +214,20 @@ impl EventLoop {
             // Else, pulls next request from user requests channel.
             // If conditions in the below branch are for flow control.
             // The branch is disabled if the next request cannot be serviced due to flow control.
-            // We read the next user request, or a pending one which needs a new packet id, only
-            // when inflight messages are < configured inflight and there are no collisions while
-            // handling previous outgoing requests.
+            // We read the next user request, or a pending publish which needs a new packet id,
+            // only when inflight messages are < the broker's Receive Maximum and there are no
+            // collisions while handling previous outgoing requests.
             //
-            // Flow control is based on ack count. Every publish, release, subscribe and
-            // unsubscribe awaiting its ack holds its packet id and counts as inflight, and new
-            // packet ids skip the ones in use. So while inflight messages are < max_inflight,
-            // a free packet id exists even when the broker acks out of order.
+            // Flow control is based on ack count. Every QoS 1, 2 publish and release awaiting its
+            // ack holds its packet id and counts as inflight, and new packet ids skip the ones in
+            // use. So while inflight messages are < max_outgoing_inflight, a free packet id
+            // exists even when the broker acks out of order.
+            //
+            // Subscribes and unsubscribes hold their packet id until acked too, but don't count
+            // as inflight: the Receive Maximum limits only QoS 1, 2 publishes (MQTT 5 section
+            // 4.9), so they take packet ids above max_outgoing_inflight. While none of those is
+            // free, the next user request, or a pending subscribe or unsubscribe, waits for an
+            // ack.
             //
             // A collision happens when a publish already carries a packet id which is in use,
             // e.g. a retransmission. It is saved to state and the eventloop is set to collision
@@ -222,7 +237,7 @@ impl EventLoop {
                 &mut self.pending,
                 &self.requests_rx,
                 self.options.pending_throttle
-            ), if pending_ready || flow_open => match o {
+            ), if requests_ready => match o {
                 Ok(request) => {
                     if let Some(outgoing) = self.state.handle_outgoing_packet(request)? {
                         network.write(outgoing).await?;
@@ -273,13 +288,12 @@ impl EventLoop {
     }
 }
 
-/// Whether handling `request` takes a new packet id: a subscribe, an unsubscribe, or a QoS 1 or 2
-/// publish which doesn't carry one yet
-fn takes_new_pkid(request: &Request) -> bool {
+/// Whether handling `request` takes a new packet id counted as inflight: a QoS 1 or 2 publish, or
+/// a release, which doesn't carry one yet
+fn takes_new_publish_pkid(request: &Request) -> bool {
     match request {
         Request::Publish(publish) => publish.qos != QoS::AtMostOnce && publish.pkid == 0,
         Request::PubRel(pubrel) => pubrel.pkid == 0,
-        Request::Subscribe(_) | Request::Unsubscribe(_) => true,
         _ => false,
     }
 }

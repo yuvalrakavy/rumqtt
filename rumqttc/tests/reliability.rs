@@ -549,20 +549,24 @@ async fn reconnection_resends_unacked_packets_from_the_previous_connection_first
 }
 
 #[tokio::test]
-async fn new_requests_carried_over_a_reconnection_wait_for_a_free_packet_id() {
+async fn requests_carried_over_a_reconnection_keep_packet_ids_unique() {
     let mut options = MqttOptions::new("dummy", "127.0.0.1", 3005);
     options
         .set_keep_alive(Duration::from_secs(5))
         .set_clean_session(false)
         .set_inflight(2);
 
-    // two publishes fill the inflight window, so the subscribe behind them stays in the
-    // request channel until the connection drops and moves it to the pending queue
+    // two publishes fill the inflight window, so the subscribe and the publish behind them stay
+    // in the request channel until the connection drops and moves them to the pending queue
     let (client, mut eventloop) = AsyncClient::new(options, 5);
     task::spawn(async move {
         start_requests(2, QoS::AtLeastOnce, 0, client.clone()).await;
         client
             .subscribe("hello/world", QoS::AtLeastOnce)
+            .await
+            .unwrap();
+        client
+            .publish("hello/world", QoS::AtLeastOnce, false, vec![3, 1, 2, 3])
             .await
             .unwrap();
         time::sleep(Duration::from_secs(10)).await;
@@ -589,14 +593,119 @@ async fn new_requests_carried_over_a_reconnection_wait_for_a_free_packet_id() {
         assert_eq!(i as u16, packet.pkid);
     }
 
-    // both packet ids are in use, so the subscribe must wait for an ack
-    if let Ok(packet) = time::timeout(Duration::from_secs(1), broker.read_packet()).await {
+    // a subscribe doesn't count toward the inflight window: it goes at once, with an id above it
+    match broker.next_packet(Duration::from_secs(2)).await {
+        Some(Packet::Subscribe(subscribe)) => assert_eq!(subscribe.pkid, 3),
+        packet => panic!("Expected a subscribe. Found = {packet:?}"),
+    }
+
+    // the publish waits for an ack, as both packet ids of the window are in use
+    if let Some(packet) = broker.next_packet(Duration::from_secs(1)).await {
         panic!("Expected nothing before an ack. Found = {packet:?}");
     }
 
     broker.ack(1).await;
-    match broker.read_packet().await {
-        Some(Packet::Subscribe(subscribe)) => assert_eq!(subscribe.pkid, 1),
+    match broker.next_packet(Duration::from_secs(2)).await {
+        Some(Packet::Publish(publish)) => {
+            assert_eq!(publish.payload[0], 3);
+            assert_eq!(publish.pkid, 1);
+        }
+        packet => panic!("Expected a publish. Found = {packet:?}"),
+    }
+}
+
+#[tokio::test]
+async fn subscribes_do_not_reduce_how_many_publishes_can_be_inflight() {
+    let mut options = MqttOptions::new("dummy", "127.0.0.1", 3006);
+    options
+        .set_keep_alive(Duration::from_secs(5))
+        .set_inflight(2);
+
+    // subscribes first, then as many publishes as the inflight window takes
+    let (client, mut eventloop) = AsyncClient::new(options, 5);
+    task::spawn(async move {
+        for _ in 0..2 {
+            client
+                .subscribe("hello/world", QoS::AtLeastOnce)
+                .await
+                .unwrap();
+        }
+        start_requests(3, QoS::AtLeastOnce, 0, client).await;
+        time::sleep(Duration::from_secs(10)).await;
+    });
+
+    task::spawn(async move {
+        run(&mut eventloop, false).await.unwrap();
+    });
+
+    // nothing is acked: both subscribes and two publishes go, each with its own packet id
+    let mut broker = Broker::new(3006, 0, false).await;
+    for pkid in [3, 4] {
+        match broker.next_packet(Duration::from_secs(2)).await {
+            Some(Packet::Subscribe(subscribe)) => assert_eq!(subscribe.pkid, pkid),
+            packet => panic!("Expected a subscribe. Found = {packet:?}"),
+        }
+    }
+    for i in 1..=2 {
+        match broker.next_packet(Duration::from_secs(2)).await {
+            Some(Packet::Publish(publish)) => {
+                assert_eq!(publish.payload[0], i);
+                assert_eq!(publish.pkid, i as u16);
+            }
+            packet => panic!("Expected a publish. Found = {packet:?}"),
+        }
+    }
+
+    // the window is full of publishes, so the third waits for a puback, not for a suback
+    if let Some(packet) = broker.next_packet(Duration::from_secs(1)).await {
+        panic!("Expected nothing before an ack. Found = {packet:?}");
+    }
+    broker.ack(2).await;
+    match broker.next_packet(Duration::from_secs(2)).await {
+        Some(Packet::Publish(publish)) => {
+            assert_eq!(publish.payload[0], 3);
+            assert_eq!(publish.pkid, 2);
+        }
+        packet => panic!("Expected a publish. Found = {packet:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_subscribe_waits_for_a_free_packet_id() {
+    // a window of u16::MAX - 1 publishes leaves one packet id to subscribes: u16::MAX
+    let mut options = MqttOptions::new("dummy", "127.0.0.1", 3007);
+    options
+        .set_keep_alive(Duration::from_secs(5))
+        .set_inflight(u16::MAX - 1);
+
+    let (client, mut eventloop) = AsyncClient::new(options, 5);
+    task::spawn(async move {
+        for _ in 0..2 {
+            client
+                .subscribe("hello/world", QoS::AtLeastOnce)
+                .await
+                .unwrap();
+        }
+        time::sleep(Duration::from_secs(10)).await;
+    });
+
+    task::spawn(async move {
+        run(&mut eventloop, false).await.unwrap();
+    });
+
+    let mut broker = Broker::new(3007, 0, false).await;
+    match broker.next_packet(Duration::from_secs(2)).await {
+        Some(Packet::Subscribe(subscribe)) => assert_eq!(subscribe.pkid, u16::MAX),
+        packet => panic!("Expected a subscribe. Found = {packet:?}"),
+    }
+
+    // the second subscribe waits for the suback rather than fail or reuse the id
+    if let Some(packet) = broker.next_packet(Duration::from_secs(1)).await {
+        panic!("Expected nothing before a suback. Found = {packet:?}");
+    }
+    broker.suback(u16::MAX).await;
+    match broker.next_packet(Duration::from_secs(2)).await {
+        Some(Packet::Subscribe(subscribe)) => assert_eq!(subscribe.pkid, u16::MAX),
         packet => panic!("Expected a subscribe. Found = {packet:?}"),
     }
 }
